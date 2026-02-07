@@ -30,6 +30,8 @@ def register_op(
     *,
     name: str | None = None,
     has_reduction: bool = False,
+    activations: list[str] | None = None,
+    allow_inplace: bool = False,
 ) -> Callable[[Callable[..., Any]], "IrOp"]: ...
 
 
@@ -38,6 +40,8 @@ def register_op(
     *,
     name: str | None = None,
     has_reduction: bool = False,
+    activations: list[str] | None = None,
+    allow_inplace: bool = False,
 ) -> "IrOp | Callable[[Callable], IrOp]":
     """
     Register a new vLLM IR op.
@@ -45,12 +49,14 @@ def register_op(
     :param f: the native implementation of the op
     :param name: the name of the op, defaults to the function name
     :param has_reduction: is this op is a reduction op, which affects batch-invariance
+    :param activations: list of activation params, defaults to params starting with 'x'
+    :param allow_inplace: add a maybe_inplace overload that allows inplace impls
     :return: the IrOp object if f is provided, otherwise a decorator
 
     Example usage:
     ```python
     @vllm.ir.register_op
-    def my_op(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def my_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         return x + y
 
 
@@ -61,7 +67,7 @@ def register_op(
     def decorator(_f: Callable):
         op_name: str = _f.__name__ if name is None else name
         assert name not in IrOp.registry
-        op = IrOp(op_name, has_reduction, _f)
+        op = IrOp(op_name, _f, has_reduction, activations, allow_inplace)
         IrOp.registry[op_name] = op
         return op
 
@@ -78,7 +84,14 @@ class IrOp:
     has_reduction: bool
     impls: dict[str, "IrOpImpl"]
 
-    def __init__(self, name: str, has_reduction: bool, native_impl: Callable):
+    def __init__(
+        self,
+        name: str,
+        native_impl: Callable,
+        has_reduction: bool,
+        activations: list[str] | None = None,
+        allow_inplace: bool = False,
+    ):
         self._py_signature = inspect.signature(native_impl)
         if any(
             p.kind == inspect.Parameter.KEYWORD_ONLY
@@ -89,11 +102,24 @@ class IrOp:
                 f"supported. That's because kwargs are not allowed during lowering."
             )
 
+        # By convention, we consider parameters starting with 'x' as activations.
+        if activations is None:
+            activations = [
+                p.name for p in self._py_signature.parameters.values() if p.name.startswith("x")
+            ]
+
         self.name = name
         self.has_reduction = has_reduction
+        self.activations = activations
+        self.activation_indices = [
+            i
+            for i, p in enumerate(self._py_signature.parameters.values())
+            if p.name in activations
+        ]
         self.impls: dict[str, IrOpImpl] = {}
         self._priority_impls: list[IrOpImpl] = []
         self._schema_str = infer_schema(native_impl, mutates_args=[])
+        self.allow_inplace = allow_inplace
 
         # native implementation
         self.impls["native"] = IrOpImpl(
@@ -123,6 +149,10 @@ class IrOp:
         assert hasattr(torch.ops.vllm_ir, name)
         self.torch_op: torch._ops.OpOverload = getattr(torch.ops.vllm_ir, name).default
 
+        if self.allow_inplace:
+            self.maybe_inplace = IrOpInplaceOverload(self)
+
+
     def register_fake(self, fn: Callable) -> Callable:
         """
         Register a fake impl for the torch custom op. If this method is not called,
@@ -146,6 +176,7 @@ class IrOp:
         supported: bool = True,
         supports_args: Callable[..., bool] | None = None,
         batch_invariant: bool | None = None,
+        inplace: bool = False,
     ):
         """
         Register an implementation for this custom op.
@@ -190,7 +221,7 @@ class IrOp:
 
         def _register_impl(f: Callable):
             impl = IrOpImpl(
-                self, provider, f, supported, supports_args, batch_invariant
+                self, provider, f, supported, supports_args, batch_invariant, inplace
             )
             self.impls[provider] = impl
 
@@ -211,7 +242,10 @@ class IrOp:
         route straight here instead of going through torch op dispatching.
         """
         impl = self.dispatch(*args, **kwargs)
-        return impl.impl_fn(*args, **kwargs)
+
+        # Default overload must be functional,
+        # use safe_impl_fn to correctly handle inplace impls.
+        return impl.safe_impl_fn(*args, **kwargs)
 
     def apply_arg_defaults(self, args) -> tuple:
         """
@@ -310,6 +344,41 @@ class IrOp:
         return [p.provider for p in self.impls.values() if p.supported]
 
 
+class IrOpInplaceOverload:
+    def __init__(self, op: IrOp):
+        params, returns = op._schema_str.split(" -> ")
+        n_outputs = returns.count("Tensor")
+
+        assert returns.count("Tensor") == len(op.activations), (
+            "Inplace overload requires the same number of outputs as activations."
+        )
+
+        assert returns.count(",") == n_outputs - 1, (
+            "Inplace overload only supports Tensor outputs for now."
+        )
+
+        self.op = op
+        self.name = f"{op.name}.maybe_inplace"
+        self._schema_str = infer_schema(op.impls["native"].impl_fn, mutates_args=op.activations)
+
+        # torch registration
+        vllm_ir_lib.define(self.name + self._schema_str)
+        vllm_ir_lib.impl(self.name, self._inner_call, dispatch_key="CompositeExplicitAutograd")
+        # fake goes to default overload for now
+        vllm_ir_lib._register_fake(self.name, self.op._fake_call)
+
+        assert hasattr(getattr(torch.ops.vllm_ir, self.op.name), "maybe_inplace")
+        self.torch_op = getattr(torch.ops.vllm_ir, self.op.name).maybe_inplace
+
+    def __call__(self, *args, **kwargs) -> Any:
+        return self.torch_op(*args, **kwargs)
+
+    def _inner_call(self, *args, **kwargs) -> Any:
+        # Calling the maybe_inplace overload means we can use inplace impls directly.
+        impl = self.op.dispatch(*args, **kwargs)
+        return impl.impl_fn(*args, **kwargs)
+
+
 class IrOpImpl:
     def __init__(
         self,
@@ -319,6 +388,7 @@ class IrOpImpl:
         supported: bool,
         supports_args: Callable[..., bool] | None,
         batch_invariant: bool,
+        inplace: bool = False,
     ):
         assert provider not in op.impls, (
             f"Implementation for provider {provider} already registered."
@@ -377,11 +447,18 @@ class IrOpImpl:
                         f"native default {op_p.default}'"
                     )
 
+        if inplace:
+            assert op.allow_inplace, (
+                f"Inplace implementation cannot be registered for op {op.name}"
+                f" that does not allow inplace."
+            )
+
         self.op = op
         self.provider = provider
         self.impl_fn = impl_fn
         self.supported = supported
         self._supports_args = supports_args
+        self.inplace = inplace
 
     @property
     def supports_all_args(self) -> bool:
@@ -393,3 +470,19 @@ class IrOpImpl:
             return True
 
         return self._supports_args(*args, **kwargs)
+
+    def safe_impl_fn(self, *args, **kwargs) -> Any:
+        """
+        Copy any inputs in activations if this is an inplace impl,
+        to ensure functional semantics.
+        """
+        if not self.inplace:
+            return self.impl_fn(*args, **kwargs)
+
+        # copy activations to ensure functional semantics
+        new_args = list(args)
+        for i in self.op.activation_indices:
+            assert isinstance(args[i], torch.Tensor)
+            new_args[i] = args[i].clone()
+
+        return self.impl_fn(*new_args, **kwargs)
