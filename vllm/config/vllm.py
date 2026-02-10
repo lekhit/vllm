@@ -151,7 +151,7 @@ def enable_norm_pad_fusion(cfg: "VllmConfig") -> bool:
     from vllm._aiter_ops import rocm_aiter_ops
 
     return (
-        rocm_aiter_ops.is_rmsnorm_enabled()
+        True  # TODO rocm_aiter_ops.is_rmsnorm_enabled()
         and not rocm_aiter_ops.is_triton_gemm_enabled()
         and cfg.model_config is not None
         and cfg.model_config.get_hidden_size() == 2880
