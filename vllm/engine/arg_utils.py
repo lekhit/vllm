@@ -633,6 +633,16 @@ class EngineArgs:
     fail_on_environ_validation: bool = False
     gdn_prefill_backend: Literal["flashinfer", "triton"] | None = None
 
+    # SegKV fields
+    enable_segkv: bool = False
+    segkv_segment_size: int = 512
+    segkv_blend_max_layer_frac: float = 0.20
+    segkv_blend_quality_threshold: float = 0.95
+    segkv_staleness_decay: float = 0.85
+    segkv_layer_selection: str = "uniform"
+    segkv_max_cached_versions: int = 5
+
+
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
@@ -1358,6 +1368,22 @@ class EngineArgs:
             default=None,
             help="Select GDN prefill backend.",
         )
+
+        # SegKV configurations
+        segkv_group = parser.add_argument_group(
+            title="SegKVConfig",
+            description="SegKV segmented KV cache management for document editing",
+        )
+        segkv_group.add_argument("--enable-segkv", action="store_true", default=False, help="Enable SegKV")
+        segkv_group.add_argument("--segkv-segment-size", type=int, default=512, help="Segment size")
+        segkv_group.add_argument("--segkv-blend-max-layer-frac", type=float, default=0.20)
+        segkv_group.add_argument("--segkv-blend-quality-threshold", type=float, default=0.95)
+        segkv_group.add_argument("--segkv-staleness-decay", type=float, default=0.85)
+        segkv_group.add_argument(
+            "--segkv-layer-selection", type=str, default="uniform", choices=["uniform", "early_biased", "bookend"]
+        )
+        segkv_group.add_argument("--segkv-max-cached-versions", type=int, default=5)
+
         return parser
 
     @classmethod
@@ -1951,6 +1977,21 @@ class EngineArgs:
         if self.gdn_prefill_backend is not None:
             self.additional_config["gdn_prefill_backend"] = self.gdn_prefill_backend
 
+        segkv_config = None
+        if self.enable_segkv:
+            from vllm.segkv.config import SegKVConfig, LayerSelectionStrategy, SegmentationMode
+            segkv_config = SegKVConfig(
+                enable_segkv=True,
+                segment_size=self.segkv_segment_size,
+                segmentation_mode=SegmentationMode.FIXED,
+                blend_quality_threshold=self.segkv_blend_quality_threshold,
+                blend_max_layer_frac=self.segkv_blend_max_layer_frac,
+                staleness_decay=self.segkv_staleness_decay,
+                layer_selection_strategy=LayerSelectionStrategy(self.segkv_layer_selection),
+                max_cached_versions=self.segkv_max_cached_versions,
+                enable_metrics=True,
+            )
+
         config = VllmConfig(
             model_config=model_config,
             cache_config=cache_config,
@@ -1976,6 +2017,7 @@ class EngineArgs:
             performance_mode=self.performance_mode,
             weight_transfer_config=self.weight_transfer_config,
             shutdown_timeout=self.shutdown_timeout,
+            segkv_config=segkv_config,
         )
 
         return config

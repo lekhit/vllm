@@ -46,6 +46,7 @@ from .speculative import EagleModelTypes, NgramGPUTypes, SpeculativeConfig
 from .structured_outputs import StructuredOutputsConfig
 from .utils import SupportsHash, config, replace
 from .weight_transfer import WeightTransferConfig
+from vllm.segkv.config import SegKVConfig
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -329,6 +330,9 @@ class VllmConfig:  # type: ignore[misc]
 
     weight_transfer_config: WeightTransferConfig | None = None
     """The configurations for weight transfer during RL training."""
+
+    segkv_config: SegKVConfig | None = None
+    """SegKV configuration for iterative document editing."""
 
     shutdown_timeout: int = Field(default=0, ge=0)
     """Shutdown grace period for in-flight requests. Shutdown will be delayed for
@@ -663,6 +667,12 @@ class VllmConfig:  # type: ignore[misc]
 
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
+
+        if self.segkv_config is not None and self.segkv_config.enable_segkv:
+            logger.info(
+                f"SegKV enabled: segment_size={self.segkv_config.segment_size}, "
+                f"blend_max_layer_frac={self.segkv_config.blend_max_layer_frac}"
+            )
 
         if self.performance_mode != "balanced":
             logger.info_once(

@@ -64,6 +64,36 @@ class LLMEngine:
         self.model_config = vllm_config.model_config
         self.observability_config = vllm_config.observability_config
 
+        # SegKV initialization
+        self.segkv_enabled = False
+        self.segkv_executor = None
+
+        if (hasattr(self.vllm_config, 'segkv_config')
+            and self.vllm_config.segkv_config is not None
+            and self.vllm_config.segkv_config.enable_segkv):
+
+            from vllm.segkv.config import SegKVConfig
+            from vllm.segkv.segment_manager import SegmentManager
+            from vllm.segkv.recompute_policy import RecomputationPolicy
+            from vllm.segkv.blend_executor import BlendExecutor
+            from vllm.segkv.phase_executor import PhaseExecutor
+            from vllm.segkv.metrics import SegKVAggregateMetrics
+
+            segkv_config = self.vllm_config.segkv_config
+            self.segkv_enabled = True
+            self.segkv_segment_manager = SegmentManager(segkv_config)
+            self.segkv_policy = RecomputationPolicy(segkv_config)
+            self.segkv_blend_executor = BlendExecutor(segkv_config)
+            self.segkv_phase_executor = PhaseExecutor(
+                config=segkv_config,
+                segment_manager=self.segkv_segment_manager,
+                policy=self.segkv_policy,
+                blend_executor=self.segkv_blend_executor,
+            )
+            self.segkv_metrics = SegKVAggregateMetrics()
+
+            logger.info("SegKV document editing support enabled.")
+
         tracing_endpoint = self.observability_config.otlp_traces_endpoint
         if tracing_endpoint is not None:
             init_tracer("vllm.llm_engine", tracing_endpoint)
@@ -206,6 +236,57 @@ class LLMEngine:
             self._supported_tasks = self.engine_core.get_supported_tasks()
 
         return self._supported_tasks
+
+    def register_document(self, doc_id: str, token_ids: list[int]) -> dict:
+        """
+        Register a new document for SegKV tracking.
+        Must be called before processing edits.
+        """
+        if not self.segkv_enabled:
+            raise RuntimeError("SegKV is not enabled. Start with --enable-segkv.")
+
+        version = self.segkv_segment_manager.register_document(doc_id, tuple(token_ids))
+        return {
+            "doc_id": doc_id,
+            "version": version.version,
+            "num_segments": version.num_segments,
+            "total_tokens": version.total_tokens,
+        }
+
+    def plan_segkv_edit(
+        self,
+        doc_id: str,
+        new_token_ids: list[int],
+        base_version: int | None = None,
+    ) -> dict:
+        """
+        Compute execution plan for document edit without executing.
+        Useful for previewing what SegKV would do.
+        """
+        if not self.segkv_enabled:
+            raise RuntimeError("SegKV is not enabled.")
+
+        num_layers = self.model_config.get_num_layers(self.parallel_config) if hasattr(self.model_config, "get_num_layers") else 32
+        plans, old_ver, new_ver = self.segkv_phase_executor.plan_execution(
+            doc_id, tuple(new_token_ids), base_version, num_layers,
+        )
+
+        savings = self.segkv_policy.estimate_total_savings(plans, num_layers)
+        
+        return {
+            "doc_id": doc_id,
+            "old_version": old_ver.version,
+            "new_version": new_ver.version,
+            "plans": [p.to_dict() for p in plans],
+            "estimated_savings": savings,
+            "summary": {
+                "reuse": sum(1 for p in plans if p.strategy.value == "exact_reuse"),
+                "recompute": sum(1 for p in plans if p.strategy.value == "full_recompute"),
+                "blend": sum(1 for p in plans if p.strategy.value == "cacheblend"),
+                "skip": sum(1 for p in plans if p.strategy.value == "skip_blend"),
+                "suffix_recompute": sum(1 for p in plans if p.strategy.value == "full_suffix_recompute"),
+            },
+        }
 
     def abort_request(self, request_ids: list[str], internal: bool = False) -> None:
         """Remove request_ids from EngineCore and Detokenizer."""

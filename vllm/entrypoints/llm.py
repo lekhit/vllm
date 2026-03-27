@@ -433,6 +433,45 @@ class LLM:
         self.renderer.clear_mm_cache()
         self.llm_engine.reset_mm_cache()
 
+    def register_document(self, doc_id: str, text: str) -> dict:
+        """
+        Register a document for SegKV editing support.
+        
+        ARGS:
+          doc_id: unique document identifier
+          text: full document text
+          
+        RETURNS:
+          Registration info dict
+        """
+        encoded = self.get_tokenizer().encode(text)
+        token_ids = encoded.ids if hasattr(encoded, "ids") else encoded
+        return self.llm_engine.register_document(doc_id, list(token_ids))
+
+    def plan_edit(
+        self,
+        doc_id: str,
+        new_text: str,
+        base_version: int | None = None,
+    ) -> dict:
+        """
+        Preview the execution plan for a document edit.
+        CPU-only, no GPU required.
+        
+        ARGS:
+          doc_id: document identifier
+          new_text: full updated document text
+          base_version: version to diff against (latest if None)
+          
+        RETURNS:
+          Execution plan dict
+        """
+        encoded = self.get_tokenizer().encode(new_text)
+        new_token_ids = encoded.ids if hasattr(encoded, "ids") else encoded
+        return self.llm_engine.plan_segkv_edit(
+            doc_id, list(new_token_ids), base_version,
+        )
+
     def get_default_sampling_params(self) -> SamplingParams:
         if self.default_sampling_params is None:
             self.default_sampling_params = self.model_config.get_diff_sampling_param()
