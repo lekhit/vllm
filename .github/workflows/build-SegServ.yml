@@ -27,9 +27,10 @@ jobs:
 
       - name: Install CUDA Toolkit
         # vLLM requires CUDA to compile its custom kernels
-        uses: Jimver/cuda-toolkit@v0.2.14
+        uses: Jimver/cuda-toolkit@master
         with:
           cuda: '12.2.0' 
+          use-github-cache: 'false'
 
       - name: Install Build Dependencies
         run: |
